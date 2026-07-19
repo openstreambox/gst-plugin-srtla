@@ -1,0 +1,28 @@
+[package]
+name = "gst-plugin-srtla"
+version = "0.1.0"
+edition = "2021"
+authors = ["Alexander Kettner <alexander@arv-live.de>"]
+description = "GStreamer SRTLA sink plugin with link bonding"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ARV-Live/gst-plugin-srtla"
+homepage = "https://github.com/ARV-Live/gst-plugin-srtla"
+
+[lib]
+name = "gstsrtla"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gst = { package = "gstreamer", version = "0.23" }
+gst-base = { package = "gstreamer-base", version = "0.23" }
+glib = "0.20"
+once_cell = "1.19"
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+rand = "0.8"
+
+[dev-dependencies]
+gst-check = { package = "gstreamer-check", version = "0.23" }
+
+[build-dependencies]
+gst-plugin-version-helper = "0.8"
