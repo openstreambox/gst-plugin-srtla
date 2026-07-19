@@ -21,7 +21,7 @@ configure your local link IPs, and you have multi-WAN SRT streaming.
 ## Building
 
 ```bash
-sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev pkg-config
+sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev pkg-config build-essential
 cargo build --release
 ```
 
