@@ -71,6 +71,7 @@ pub struct SrtlaSink {
     settings: Mutex<Settings>,
     state: Mutex<Option<State>>,
     srtsink: Mutex<Option<gst::Element>>,
+    bond: Mutex<Option<Arc<Mutex<Bond>>>>,
 }
 
 #[glib::object_subclass]
@@ -150,6 +151,11 @@ impl ObjectImpl for SrtlaSink {
                     .default_value(Some(DEFAULT_PASSPHRASE))
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecBoxed::builder::<gst::Structure>("stats")
+                    .nick("Bond Statistics")
+                    .blurb("Current SRTLA bond statistics (aggregate + per-link) as a GstStructure")
+                    .read_only()
+                    .build(),
             ]
         });
         PROPS.as_ref()
@@ -169,6 +175,23 @@ impl ObjectImpl for SrtlaSink {
     }
 
     fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+        if pspec.name() == "stats" {
+            let bond_guard = self.bond.lock().unwrap();
+            let structure = match bond_guard.as_ref() {
+                Some(bond) => bond.lock().unwrap().stats_structure(),
+                None => gst::Structure::builder("stats")
+                    .field("sent", 0u64)
+                    .field("returned", 0u64)
+                    .field("overflow", 0u64)
+                    .field("dropped", 0u64)
+                    .field("naks", 0u64)
+                    .field("rtt-ms", 0.0f64)
+                    .field("links-json", "[]")
+                    .build(),
+            };
+            return structure.to_value();
+        }
+
         let s = self.settings.lock().unwrap();
         match pspec.name() {
             "host" => s.host.to_value(),
@@ -310,6 +333,7 @@ impl SrtlaSink {
 
         // Worker thread: maintenance, proxy forwarding, reverse path
         let bond = Arc::new(Mutex::new(bond));
+        *self.bond.lock().unwrap() = Some(Arc::clone(&bond));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let worker = {
             let bond = Arc::clone(&bond);
@@ -366,5 +390,6 @@ impl SrtlaSink {
                 let _ = h.join();
             }
         }
+        *self.bond.lock().unwrap() = None;
     }
 }

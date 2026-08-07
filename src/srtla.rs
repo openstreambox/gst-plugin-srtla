@@ -50,6 +50,36 @@ pub const WINDOW_INCR: u32 = 1;     // per ACK event
 pub const PKT_LOG_TIMEOUT_MS: u64 = 2_000;
 pub const PKT_LOG_MAX: usize = 32_768;
 
+// ─── Per-link quality gating ──────────────────────────────────────────────────
+// Window shrink/grow already biases traffic towards the healthier link, but
+// only gradually — a link that starts NAK'ing heavily still gets picked
+// proportionally to whatever window it has left, which keeps feeding it
+// packets that are likely to be lost too. This adds a faster, relative signal
+// on top: each link's NAK/sent ratio is compared against the *best* active
+// link's ratio every tick, and a link doing meaningfully worse gets its
+// selection weight cut hard and fast, recovering gradually once it's back in
+// line with its peers. Relative (not an absolute NAK threshold) because this
+// bond's healthy-state NAK/sent baseline varies a lot with network conditions
+// — an absolute cutoff would either never fire or fire constantly.
+pub const QUALITY_EVAL_INTERVAL_MS: u64 = 1_000;
+/// Minimum packets sent on a link this interval before its ratio is trusted —
+/// below this, a couple of unlucky losses would look like a huge ratio.
+pub const QUALITY_MIN_SAMPLE: u64 = 10;
+/// A link is "meaningfully worse" than the best link this interval if its
+/// ratio exceeds the best ratio by this multiple...
+pub const QUALITY_BAD_MULTIPLE: f64 = 2.0;
+/// ...AND by at least this absolute margin, so noise on an already-tiny best
+/// ratio doesn't trip the gate.
+pub const QUALITY_BAD_FLOOR: f64 = 0.05;
+// Bumped MIN from 0.05 and softened PENALTY from 0.7: the original values
+// crushed a "relatively worse" link down to a ~5% trickle within ~9 bad
+// intervals — effectively failover, not bonding. A link that's merely worse
+// (not actually broken) should still carry a real parallel share; genuine
+// collapse is still caught independently by the TS-side dropRatio brake.
+pub const QUALITY_PENALTY: f64 = 0.85;    // multiplicative cut per bad interval
+pub const QUALITY_MIN: f64 = 0.35;        // soft gate, keeps a real parallel share
+pub const QUALITY_RECOVERY_PER_TICK: f64 = 0.05;
+
 fn pkt_type(buf: &[u8]) -> Option<u16> {
     if buf.len() >= 2 {
         Some(u16::from_be_bytes([buf[0], buf[1]]))
@@ -89,6 +119,16 @@ pub struct Link {
     pub state:             LinkState,
     pub in_flight:         u32,
     pub window:            u32,
+    /// EWMA round-trip time, in ms: send timestamp (from `pkt_log`) to the
+    /// arrival of an ACK/cumulative-ACK confirming that sequence number.
+    /// 0.0 = no sample yet.
+    pub rtt_ms:            f64,
+    /// Selection-weight multiplier in (0.0, 1.0], see `Bond::update_link_quality`.
+    pub quality:           f64,
+    pub nak_count:         u64,
+    pub sent_count:        u64,
+    q_prev_nak:            u64,
+    q_prev_sent:           u64,
     pub last_keepalive_tx: Instant,
     pub last_rx:           Instant,
     pub last_sent:         Instant,
@@ -107,6 +147,12 @@ impl Link {
             state: LinkState::Idle,
             in_flight: 0,
             window: WINDOW_INIT,
+            rtt_ms: 0.0,
+            quality: 1.0,
+            nak_count: 0,
+            sent_count: 0,
+            q_prev_nak: 0,
+            q_prev_sent: 0,
             last_keepalive_tx: now,
             last_rx: now,
             last_sent: now,
@@ -150,6 +196,16 @@ impl Link {
         self.window = (self.window * 95 / 100).max(WINDOW_MIN);
     }
 
+    /// EWMA-smooth a fresh RTT sample (ms). First sample seeds the average
+    /// directly rather than smoothing from 0, so a single slow start doesn't
+    /// take many rounds to "catch up".
+    pub fn sample_rtt(&mut self, ms: f64) {
+        if ms <= 0.0 || !ms.is_finite() {
+            return;
+        }
+        self.rtt_ms = if self.rtt_ms <= 0.0 { ms } else { self.rtt_ms * 0.9 + ms * 0.1 };
+    }
+
     pub fn has_capacity(&self) -> bool {
         self.state == LinkState::Active && self.in_flight < self.window
     }
@@ -159,8 +215,13 @@ impl Link {
     /// few rounds in a row, its window kept growing, its score skyrocketed,
     /// and the other link never got picked. Linear "free slots" mirrors
     /// what srtla_send.c does and produces a much more even split.
+    ///
+    /// `quality` (see `Bond::update_link_quality`) folds in on top of that:
+    /// window-based headroom reacts over several round trips, quality reacts
+    /// within one eval tick to a link doing relatively worse than its peers.
     pub fn score(&self) -> i64 {
-        self.window as i64 - self.in_flight as i64
+        let headroom = self.window as i64 - self.in_flight as i64;
+        (headroom as f64 * self.quality).round() as i64
     }
 }
 
@@ -175,6 +236,7 @@ pub struct Bond {
     pkt_log: HashMap<u32, (usize, Instant)>,
     pkt_order: VecDeque<u32>,
     last_stats: Instant,
+    last_quality_eval: Instant,
     stat_sent: u64,
     stat_returned: u64,
     stat_overflow: u64,
@@ -198,6 +260,7 @@ impl Bond {
             pkt_log: HashMap::new(),
             pkt_order: VecDeque::new(),
             last_stats: Instant::now(),
+            last_quality_eval: Instant::now(),
             stat_sent: 0,
             stat_returned: 0,
             stat_overflow: 0,
@@ -226,6 +289,55 @@ impl Bond {
             l.state = LinkState::Idle;
             l.in_flight = 0;
             l.window = WINDOW_INIT;
+            l.rtt_ms = 0.0;
+            l.quality = 1.0;
+            l.nak_count = 0;
+            l.sent_count = 0;
+            l.q_prev_nak = 0;
+            l.q_prev_sent = 0;
+        }
+    }
+
+    /// Compares each active link's NAK/sent ratio this interval against the
+    /// *best* active link's ratio and penalizes ones doing meaningfully
+    /// worse — see the QUALITY_* constants for why this is relative rather
+    /// than an absolute threshold.
+    pub fn update_link_quality(&mut self, now: Instant) {
+        if now.duration_since(self.last_quality_eval) < Duration::from_millis(QUALITY_EVAL_INTERVAL_MS) {
+            return;
+        }
+        self.last_quality_eval = now;
+
+        let mut ratios: Vec<Option<f64>> = Vec::with_capacity(self.links.len());
+        for l in &mut self.links {
+            let delta_sent = l.sent_count.saturating_sub(l.q_prev_sent);
+            let delta_nak  = l.nak_count.saturating_sub(l.q_prev_nak);
+            l.q_prev_sent = l.sent_count;
+            l.q_prev_nak  = l.nak_count;
+            ratios.push(if l.state == LinkState::Active && delta_sent >= QUALITY_MIN_SAMPLE {
+                Some(delta_nak as f64 / delta_sent as f64)
+            } else {
+                None
+            });
+        }
+
+        let best_ratio = ratios.iter().flatten().cloned().fold(f64::INFINITY, f64::min);
+        if !best_ratio.is_finite() {
+            return; // no active link had enough traffic this interval to judge
+        }
+
+        for (l, ratio) in self.links.iter_mut().zip(ratios) {
+            match ratio {
+                Some(r) if r > best_ratio * QUALITY_BAD_MULTIPLE + QUALITY_BAD_FLOOR => {
+                    l.quality = (l.quality * QUALITY_PENALTY).max(QUALITY_MIN);
+                }
+                _ => {
+                    // In line with (or better than) peers, or too idle to judge this
+                    // interval — recover. Idle links recovering is fine: has_capacity()
+                    // already gates whether they're picked at all.
+                    l.quality = (l.quality + QUALITY_RECOVERY_PER_TICK).min(1.0);
+                }
+            }
         }
     }
 
@@ -256,8 +368,9 @@ impl Bond {
     /// and is essential when the server's reverse path doesn't mirror our
     /// forward path (which is the rule, not the exception).
     fn ack_seq(&mut self, seq: u32, recv_link: usize) {
-        if let Some((idx, _)) = self.pkt_log.remove(&seq) {
+        if let Some((idx, sent_at)) = self.pkt_log.remove(&seq) {
             self.links[idx].in_flight = self.links[idx].in_flight.saturating_sub(1);
+            self.links[idx].sample_rtt(sent_at.elapsed().as_secs_f64() * 1000.0);
         }
         self.links[recv_link].grow_window();
     }
@@ -265,17 +378,18 @@ impl Bond {
     /// Cumulative SRT ACK: everything strictly below `upto` arrived.
     /// Grows the receive link's window once per ACK event.
     fn ack_below(&mut self, upto: u32, recv_link: usize) {
-        let mut credited: Vec<usize> = Vec::new();
-        self.pkt_log.retain(|&seq, &mut (idx, _)| {
+        let mut credited: Vec<(usize, Instant)> = Vec::new();
+        self.pkt_log.retain(|&seq, &mut (idx, sent_at)| {
             if seq_lt(seq, upto) {
-                credited.push(idx);
+                credited.push((idx, sent_at));
                 false
             } else {
                 true
             }
         });
-        for idx in credited {
+        for (idx, sent_at) in credited {
             self.links[idx].in_flight = self.links[idx].in_flight.saturating_sub(1);
+            self.links[idx].sample_rtt(sent_at.elapsed().as_secs_f64() * 1000.0);
         }
         self.links[recv_link].grow_window();
     }
@@ -284,6 +398,7 @@ impl Bond {
         self.stat_nak += 1;
         if let Some(&(idx, _)) = self.pkt_log.get(&seq) {
             self.links[idx].shrink_window();
+            self.links[idx].nak_count += 1;
         }
     }
 
@@ -438,6 +553,7 @@ impl Bond {
         let now = Instant::now();
 
         self.purge_stale_log();
+        self.update_link_quality(now);
 
         if now.duration_since(self.last_stats) > Duration::from_secs(3) {
             self.last_stats = now;
@@ -450,8 +566,8 @@ impl Bond {
             for l in &self.links {
                 gst::info!(
                     CAT,
-                    "  link {}: state={:?} window={} in_flight={}",
-                    l.local_addr, l.state, l.window, l.in_flight
+                    "  link {}: state={:?} window={} in_flight={} rtt_ms={:.1} quality={:.2}",
+                    l.local_addr, l.state, l.window, l.in_flight, l.rtt_ms, l.quality
                 );
             }
         }
@@ -506,6 +622,7 @@ impl Bond {
                                 link.state = LinkState::Down;
                                 link.in_flight = 0;
                                 link.window = WINDOW_INIT;
+                                link.quality = 1.0;
                             }
                         }
                     }
@@ -556,6 +673,7 @@ impl Bond {
         };
         let _ = self.links[idx].socket.send_to(data, self.links[idx].remote_addr);
         self.links[idx].last_sent = Instant::now();
+        self.links[idx].sent_count += 1;
         self.stat_sent += 1;
 
         // Log SRT data packets (bit 31 of first u32 clear) for per-link
@@ -570,6 +688,48 @@ impl Bond {
 
     pub fn active_count(&self) -> usize {
         self.links.iter().filter(|l| l.state == LinkState::Active).count()
+    }
+
+    /// Snapshot of aggregate + per-link bond stats as a GstStructure, for
+    /// external consumers (e.g. the "stats" element property) to read.
+    /// Per-link details are packed as a hand-rolled JSON array string rather
+    /// than a nested GstStructure array, since addresses/debug-formatted
+    /// states never contain characters needing escaping.
+    pub fn stats_structure(&self) -> gst::Structure {
+        let links_json = {
+            let parts: Vec<String> = self
+                .links
+                .iter()
+                .map(|l| {
+                    format!(
+                        r#"{{"address":"{}","state":"{:?}","window":{},"in_flight":{},"rtt_ms":{:.1},"quality":{:.2}}}"#,
+                        l.local_addr, l.state, l.window, l.in_flight, l.rtt_ms, l.quality
+                    )
+                })
+                .collect();
+            format!("[{}]", parts.join(","))
+        };
+
+        // Aggregate RTT: the fastest currently-active path, mirroring
+        // belacoder's `rttMin` baseline — the healthiest link sets the floor
+        // that increases are judged against.
+        let rtt_ms_agg = self
+            .links
+            .iter()
+            .filter(|l| l.state == LinkState::Active && l.rtt_ms > 0.0)
+            .map(|l| l.rtt_ms)
+            .fold(f64::INFINITY, f64::min);
+        let rtt_ms_agg = if rtt_ms_agg.is_finite() { rtt_ms_agg } else { 0.0 };
+
+        gst::Structure::builder("stats")
+            .field("sent", self.stat_sent)
+            .field("returned", self.stat_returned)
+            .field("overflow", self.stat_overflow)
+            .field("dropped", self.stat_dropped)
+            .field("naks", self.stat_nak)
+            .field("rtt-ms", rtt_ms_agg)
+            .field("links-json", links_json)
+            .build()
     }
 }
 
